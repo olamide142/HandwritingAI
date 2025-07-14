@@ -1,8 +1,13 @@
 import os
-
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from PIL import Image, ImageDraw
-
+import uvicorn
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import load_model
 
 
 TEMPLATE = \
@@ -19,14 +24,77 @@ TEMPLATE = \
             height: 100%;
             overflow-y: hidden; 
             overflow-x: hidden;
+            background: #8B4513; /* Brown background */
+            margin: 0;
+            padding: 0;
             }
             .canvas {
             margin: 0;
             display: flex;
-            /* This centers our sketch horizontally. */
+            flex-direction: column;
             justify-content: center;
-            /* This centers our sketch vertically. */
             align-items: center;
+            height: 100vh;
+            }
+            .chalkboard {
+            border: 15px solid #654321; /* Dark brown border */
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            background: #2F4F2F; /* Dark green chalkboard color */
+            position: relative;
+            }
+            .controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            right: 10px;
+            background: rgba(139, 69, 19, 0.95); /* Semi-transparent brown */
+            padding: 10px;
+            border-radius: 8px;
+            z-index: 1000;
+            }
+            .control-btn {
+            background: #8B4513;
+            color: white;
+            border: 2px solid #654321;
+            border-radius: 5px;
+            padding: 8px 15px;
+            margin: 2px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: bold;
+            }
+            .control-btn:hover {
+            background: #A0522D;
+            transform: translateY(-2px);
+            }
+            .control-btn.active {
+            background: #CD853F;
+            border-color: #DAA520;
+            }
+            .eraser-btn.active {
+            background: #696969;
+            border-color: #808080;
+            }
+            #theText {
+            background: white;
+            border: 2px solid #654321;
+            border-radius: 5px;
+            padding: 5px;
+            margin: 5px;
+            font-size: 16px;
+            }
+            .brush-controls {
+            display: inline-block;
+            margin-left: 10px;
+            }
+            .brush-controls label {
+            color: white;
+            font-weight: bold;
+            }
+            .brush-controls span {
+            color: white;
+            font-weight: bold;
             }
         </style>
         <link rel="stylesheet" href="https://www.w3schools.com/w3css/4/w3.css">
@@ -39,25 +107,59 @@ TEMPLATE = \
             var xhr = new XMLHttpRequest();
             
             var Points = [];
-            var WIDTH = screen.width;
-            var HEIGHT =  screen.height;
+            var WIDTH = screen.width * 0.3; // Make canvas smaller to fit border
+            var HEIGHT = screen.height * 0.7;
             var boundingBox = [];
             var showBoundingBox = false;
             var res;
+            var brushWidth = 20; // Changed pencil width to 20
+            var isErasing = false;
+            var chalkboardColor = [47, 79, 47]; // Dark green chalkboard color
 
             function setup() {
-                createCanvas(WIDTH, HEIGHT);
-                background(255/2);
+                let canvas = createCanvas(WIDTH, HEIGHT);
+                canvas.parent('chalkboard');
+                background(chalkboardColor[0], chalkboardColor[1], chalkboardColor[2]); // Dark green chalkboard color
                 noStroke();
-                fill(0);
+                fill(255); // White chalk
+            }
+
+            function updateBrushWidth(val) {
+                brushWidth = parseInt(val);
+                document.getElementById('brushWidthValue').innerText = val;
+            }
+
+            function toggleEraser() {
+                isErasing = !isErasing;
+                const eraserBtn = document.getElementById('eraserBtn');
+                const drawBtn = document.getElementById('drawBtn');
+                
+                if (isErasing) {
+                    eraserBtn.classList.add('active');
+                    drawBtn.classList.remove('active');
+                } else {
+                    eraserBtn.classList.remove('active');
+                    drawBtn.classList.add('active');
+                }
             }
 
             function draw() {
-                stroke(0);
+                if (isErasing) {
+                    // Eraser mode - draw chalkboard green lines
+                    stroke(chalkboardColor[0], chalkboardColor[1], chalkboardColor[2]); // Chalkboard green
+                    strokeWeight(brushWidth * 2); // Make eraser wider
+                } else {
+                    // Drawing mode - draw white chalk lines
+                    stroke(255, 255, 255); // White chalk
+                    strokeWeight(brushWidth);
+                }
 
                 coordinate = [mouseX, mouseY, pmouseX, pmouseY];
                 if (mouseIsPressed === true) {
-                    Points.push(coordinate)
+                    if (!isErasing) {
+                        // Only add points when drawing, not erasing
+                        Points.push(coordinate);
+                    }
                     line.apply(null, coordinate);
                 }
 
@@ -66,7 +168,7 @@ TEMPLATE = \
                         line.apply(null, Points[point_xy]);
                     }
                     fill(120);
-                    setLineDash([5, 5]); //create the dashed line pattern here
+                    setLineDash(list); //create the dashed line pattern here
                     rect.apply(null, boundingBox);
                     setLineDash([0, 0]); //create the dashed line pattern here
 
@@ -79,30 +181,75 @@ TEMPLATE = \
             }
 
             function giveMeText() {
+                // Only send points that represent visible drawings (not erased areas)
+                var visiblePoints = Points.filter(function(point) {
+                    // Filter out any points that might be invalid or represent erased areas
+                    return point && point.length === 4 && 
+                           !isNaN(point[0]) && !isNaN(point[1]) && 
+                           !isNaN(point[2]) && !isNaN(point[3]);
+                });
+                
                 xhr.open("POST", '/getHandwritting', true);
-
-                //Send the proper header information along with the request
                 xhr.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
-                xhr.send(JSON.stringify({points : Points, dimension : [WIDTH, HEIGHT]}));
-                res = JSON.parse(xhr.responseText);
-                console.log(res)
-                showBoundingBox = true;
-                redraw(1);
-                showBoundingBox = false;
+                xhr.send(JSON.stringify({
+                    points: visiblePoints, 
+                    dimension: [WIDTH, HEIGHT], 
+                    brushWidth: brushWidth
+                }));
+                
+                xhr.onreadystatechange = function() {
+                    if (xhr.readyState === 4 && xhr.status === 200) {
+                        res = JSON.parse(xhr.responseText);
+                        console.log(res);
+                        
+                        // Display the prediction
+                        document.getElementById('theText').value = res.predicted_digit;
+                        
+                        showBoundingBox = true;
+                        redraw(1);
+                        showBoundingBox = false;
+                    }
+                };
+            }
+
+            function clearCanvas() {
+                Points = [];
+                background(chalkboardColor[0], chalkboardColor[1], chalkboardColor[2]); // Reset to chalkboard color
+                document.getElementById('theText').value = '';
+                // Reset eraser mode
+                isErasing = false;
+                const eraserBtn = document.getElementById('eraserBtn');
+                const drawBtn = document.getElementById('drawBtn');
+                eraserBtn.classList.remove('active');
+                drawBtn.classList.add('active');
+                
+                // Reset drawing settings
+                stroke(255, 255, 255); // White chalk
+                strokeWeight(brushWidth);
+                fill(255); // White chalk
             }
         </script>
 
     </head>
 
-    <body class="w3-container">
-        <div class="canvas w3-center" id="canvas"></div>
-        <div class="w3-display-top w3-margin">
-            <p class="w3-small w3-center w3-text-gray">Handwriting AI by L4M5</p>
-            <button class="w3-button w3-gray w3-round" onclick="giveMeText()">Give me text</button>
-            <button class="w3-button w3-gray w3-round w3-right">Delete</button>
-            <input id="theText" type="text">
+    <body>
+        <div class="canvas">
+            <div id="chalkboard" class="chalkboard">
+                <div class="controls">
+                    <p class="w3-small w3-center w3-text-white" style="margin: 0 0 10px 0;">Handwriting AI by Victor Olowofeso</p>
+                    <button class="control-btn" onclick="giveMeText()">Recognize</button>
+                    <button class="control-btn" onclick="clearCanvas()">Clear All</button>
+                    <button class="control-btn active" id="drawBtn" onclick="toggleEraser()">Chalk</button>
+                    <button class="control-btn" id="eraserBtn" onclick="toggleEraser()">Eraser</button>
+                    <input id="theText" type="text" placeholder="Prediction will appear here">
+                    <div class="brush-controls">
+                        <label for="brushWidth">Chalk Width:</label>
+                        <input type="range" id="brushWidth" min="1" max="20" value="20" oninput="updateBrushWidth(this.value)"> <!-- Changed pencil width to 20 -->
+                        <span id="brushWidthValue">20</span> <!-- Changed pencil width to 20 -->
+                    </div>
+                </div>
+            </div>
         </div>
-
     </body>
 
     </html>
@@ -110,77 +257,150 @@ TEMPLATE = \
 
 
 
-class BoundingBox:
-    """ To handle cropping """
+# Load trained model
+MODEL_PATH = "models/simple_mnist.keras"
+# MODEL_PATH = "models/emnist.keras"
+mnist_model = load_model(MODEL_PATH)
 
-    def __init__(self, file):
-        self.points = map(
-                        lambda x: map(float, x.split(',')), 
-                        open(file, 'r').readlines()
-                    )
-        self.minX = float("inf")
-        self.minY = float("inf")
-        self.maxX = -float("inf")
-        self.maxY = -float("inf")
+# Initialize FastAPI
+app = FastAPI()
 
-
-    def getBoundingBox(self):
-        for point in self.points:
-            x1,y1,x2,y2 = point
-            self.minX = min([self.minX, x1, x2])
-            self.minY = min([self.minY, y1, y2])
-            self.maxX = max([self.maxX, x1, x2])
-            self.maxY = max([self.maxY, y1, y2])
-
-        return {'topLeft': (self.minX, self.maxY),
-                'topRight': (self.maxX, self.maxY),
-                'bottomRight': (self.maxX, self.minY),
-                'bottomLeft': (self.minX, self.minY)
-            }
+# Allow CORS (for browser interaction)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return TEMPLATE
-
-
-@app.route('/getHandwritting', methods=['POST'])
-def getPoints():
-    os.remove('pointsXY.txt')
-    f = open('pointsXY.txt', 'a')
-
-    last = None
-
-    for point in request.json.get('points'):
-        if point != last:
-            last = point
-            f.write(",".join(map(str, point)) + '\n')
-
-    f.close()
+def get_bounding_box(points):
+    """
+    Calculate bounding box from drawing points.
     
-    # Create an image of the sketch
-    createImage(*request.json.get('dimension'))
-    # Get bounding box of the sketch
-    return jsonify(BoundingBox('pointsXY.txt').getBoundingBox())
+    Args:
+        points: List of [x1, y1, x2, y2] coordinates
+        
+    Returns:
+        Dictionary with bounding box coordinates
+    """
+    if not points:
+        return None
+    
+    min_x = float('inf')
+    min_y = float('inf')
+    max_x = -float('inf')
+    max_y = -float('inf')
+    
+    for point in points:
+        x1, y1, x2, y2 = point
+        min_x = min(min_x, x1, x2)
+        min_y = min(min_y, y1, y2)
+        max_x = max(max_x, x1, x2)
+        max_y = max(max_y, y1, y2)
+    
+    return {
+        'left': int(min_x),
+        'top': int(min_y),
+        'right': int(max_x),
+        'bottom': int(max_y),
+        'width': int(max_x - min_x),
+        'height': int(max_y - min_y)
+    }
 
+def crop_image_with_padding(img, padding=20):
+    """
+    Crop image to remove excess background and add padding.
+    
+    Args:
+        img: PIL Image
+        padding: Extra pixels around the content
+        
+    Returns:
+        Cropped PIL Image
+    """
+    # Convert to numpy array for easier processing
+    img_array = np.array(img)
+    
+    # Find non-zero (drawn) pixels
+    non_zero_coords = np.where(img_array > 0)
+    
+    if len(non_zero_coords[0]) == 0:
+        # No content found, return original image
+        return img
+    
+    # Get the bounds of the content
+    min_y, max_y = non_zero_coords[0].min(), non_zero_coords[0].max()
+    min_x, max_x = non_zero_coords[1].min(), non_zero_coords[1].max()
+    
+    # Add padding
+    min_x = max(0, min_x - padding)
+    min_y = max(0, min_y - padding)
+    max_x = min(img.width, max_x + padding)
+    max_y = min(img.height, max_y + padding)
+    
+    # Crop the image
+    cropped = img.crop((min_x, min_y, max_x, max_y))
+    return cropped
 
-def createImage(width, height):
-    img = Image.new("RGB", (width, height), (255, 255, 255))
-    img.save("image.png", "PNG")
+# Pydantic request model
+class PointsRequest(BaseModel):
+    points: list
+    dimension: list
+    brushWidth: int = 20  # Changed pencil width to 20
 
-    with Image.open("image.png") as im:
+# Drawing handler
+def create_image(points, width, height, brush_width=60):
+    img = Image.new("L", (width, height), 0)  # Black background (0)
+    draw = ImageDraw.Draw(img)
+    for x1, y1, x2, y2 in points:
+        draw.line(((x1, y1), (x2, y2)), fill=255, width=brush_width)  # White lines (255)
+    return img
 
-        draw = ImageDraw.Draw(im)
-        for i in open('pointsXY.txt').readlines():
-            x1,y1,x2,y2 = map(float, i.split(","))
-            draw.line(((x1, y1), (x2, y2)), fill=225//2, width=2)
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTMLResponse(content=TEMPLATE)
 
-        im.save("image.png", "PNG")
+@app.post("/getHandwritting")
+async def get_handwriting(request: Request):
+    data = await request.json()
+    points = data.get("points")
+    dimension = data.get("dimension")
+    brush_width = data.get("brushWidth", 20)
 
+    if not points or not dimension:
+        return JSONResponse(status_code=400, content={"error": "Missing data"})
 
+    # Create image
+    raw_img = create_image(points, dimension[0], dimension[1], brush_width)
+    
+    # Crop out excess background with padding
+    cropped_img = crop_image_with_padding(raw_img, padding=20)
+    
+    # Save the cropped image
+    cropped_img.save("cropped_image.png", "PNG")
+    
+    # Resize to 28x28 for model input
+    img = cropped_img.resize((28, 28)).convert("L")
+    
+    # Save the resized image for MNIST format
+    img.save("mnist_image.png", "PNG")
 
+    # Normalize and reshape for model
+    img_array = np.array(img).astype("float32") / 255.0
+    img_array = np.expand_dims(img_array, axis=(0, -1))  # Shape: (1, 28, 28, 1)
+
+    # Predict digit
+    prediction = mnist_model.predict(img_array, verbose=0)
+    predicted_digit = int(np.argmax(prediction[0]))
+    confidence = float(np.max(prediction[0]))
+
+    return JSONResponse({
+        "predicted_digit": predicted_digit,
+        "confidence": confidence,
+        "probabilities": prediction[0].tolist()
+    })
 
 if __name__ == "__main__":
-    app.run(debug=True, port=6969)
+    uvicorn.run("handwritting_ai:app", host="0.0.0.0", port=6969, reload=True)
